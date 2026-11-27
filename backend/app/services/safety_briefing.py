@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import publish_gate as gate
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -50,6 +51,8 @@ class SafetyBriefingService(BaseModuleService):
                 if ws_row.get("工序名称", "") == process:
                     ws_row["安全交底已完成"] = True
                     effects.append(dict(ws_row))
+            # 交底状态变化后刷新排期发布待办中的缺项编号
+            gate.sync_schedule_todos(process)
         elif action == "重新交底":
             process = entry.get("交底工序", "")
             for sched in store.rows("construction_schedule"):
@@ -57,4 +60,5 @@ class SafetyBriefingService(BaseModuleService):
                     sched["安全交底已完成"] = False
                     sched["abnormal"] = True
                     effects.append(dict(sched))
+            gate.sync_schedule_todos(process)
         return effects

@@ -93,7 +93,8 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="successMessage" class="success-text" data-testid="action-success">{{ successMessage }}</span>
+      <span v-if="errorMessage" class="error-text" data-testid="action-error">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
@@ -114,6 +115,7 @@ const meta = moduleMeta(props.moduleKey)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const successMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
@@ -134,6 +136,7 @@ function resetFilters() { filters.value = {}; void reload() }
 
 async function exportRows() {
   errorMessage.value = ''
+  successMessage.value = ''
   try { await downloadEntries(meta.key, filters.value) }
   catch (e) { errorMessage.value = e instanceof Error ? e.message : '导出失败' }
 }
@@ -141,14 +144,16 @@ async function exportRows() {
 function openCreate() {
   createValues.value = Object.fromEntries(meta.fields.map((f) => [f, '']))
   errorMessage.value = ''
+  successMessage.value = ''
   showCreate.value = true
 }
 
 async function submitCreate() {
-  creating.value = true; errorMessage.value = ''
+  creating.value = true; errorMessage.value = ''; successMessage.value = ''
   try {
     const r = await createEntry(meta.key, createValues.value)
     if (!r.ok) throw new Error(r.message)
+    successMessage.value = r.message || `${meta.entity}已登记`
     showCreate.value = false; await reload()
   } catch (e) { errorMessage.value = e instanceof Error ? e.message : '登记失败' }
   finally { creating.value = false }
@@ -156,9 +161,12 @@ async function submitCreate() {
 
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
+  successMessage.value = ''
   try {
     const r = await applyAction(meta.key, Number(row.id), action)
     if (!r.ok) throw new Error(r.message)
+    // 保留当次回执（含核验记录编号），旧页面/重试时也能看到已受理结果。
+    successMessage.value = r.message || `「${action}」已受理`
     await reload()
   } catch (e) { errorMessage.value = e instanceof Error ? e.message : '操作失败' }
 }
@@ -180,4 +188,6 @@ onMounted(reload)
 .create-field { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }
 .create-field span { font-size:13px; color:var(--text-secondary,#4a5568); }
 .create-field input { padding:6px 8px; border:1px solid var(--border-color,#e2e8f0); border-radius:4px; font-size:13px; }
+.success-text { color:#15803d; }
+.error-text { color:#b91c1c; }
 </style>

@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services import publish_gate
 from app.services import SERVICE_INSTANCES, service_for
 from app.store import store
 
@@ -74,7 +75,7 @@ def export_entries(
     )
 
 
-@router.get("/{module}/{entry_id}", response_model=dict)
+@router.get("/{module}/{entry_id:int}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)
     entry = service.get_entry(entry_id)
@@ -222,3 +223,93 @@ def dependency_graph() -> dict[str, Any]:
 
     ]
     return graph
+
+
+# ── 发布资格收拢查询：工序发布 / 排期发布两份待办与核验记录 ──
+
+@router.get("/cross-module/publish-readiness")
+def get_publish_readiness(process: str = Query(..., description="工序/计划工序名称")) -> dict[str, Any]:
+    """按工序名返回两个发布入口的受理状态、缺项（含编号/原入口）与核验记录。"""
+    schedules = [
+        row for row in store.rows("construction_schedule")
+        if str(row.get("计划工序", "")) == process
+    ]
+    work_rows = store.query_by_field("work_sequence", "工序名称", process)
+    work_states = []
+    for ws in work_rows:
+        live = store.find("work_sequence", int(ws["id"])) or ws
+        work_states.append({
+            "entry_id": live.get("id"),
+            "module": "work_sequence",
+            "action": "发布工序",
+            "status": live.get("status"),
+            "accepted": publish_gate.is_publish_accepted(
+                "work_sequence", live, "发布工序"),
+            "check": publish_gate.check_work_publish(live),
+            "verification_id": live.get("核验记录编号"),
+            "verification": live.get("发布核验"),
+        })
+    schedule_states = []
+    for sc in schedules:
+        todo, summary, all_accepted = publish_gate.build_schedule_publish_state(sc)
+        schedule_states.append({
+            "entry_id": sc.get("id"),
+            "module": "construction_schedule",
+            "action": "发布排期",
+            "status": sc.get("status"),
+            "accepted": summary["排期发布"]["accepted"],
+            "all_accepted": all_accepted,
+            "todos": list(todo),
+            "todo_text": str(todo),
+            "summary": summary,
+            "verification_id": sc.get("核验记录编号"),
+            "verification": sc.get("发布核验"),
+        })
+    return {
+        "process": process,
+        "work_publish": work_states,
+        "schedule_publish": schedule_states,
+        # 便捷字段：所有排期条目都已同步过「发布待办」
+        "todos": [t for s in schedule_states for t in s["todos"]],
+    }
+
+
+@router.get("/cross-module/publish-todos")
+def list_publish_todos() -> dict[str, Any]:
+    """返回全部施工排期的发布待办（含已清空待办的已受理条目）。"""
+    items = []
+    for sc in store.rows("construction_schedule"):
+        process = str(sc.get("计划工序", "") or "")
+        publish_gate.sync_schedule_todos(process)
+        items.append({
+            "module": "construction_schedule",
+            "entry_id": sc.get("id"),
+            "process": process,
+            "status": sc.get("status"),
+            "todos": list(sc.get("发布待办", [])),
+            "all_accepted": sc.get("发布已全部受理", False),
+        })
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/cross-module/publish-gate/{module}/{entry_id:int}")
+def publish_gate_detail(module: str, entry_id: int) -> dict[str, Any]:
+    """按条目查询发布资格检查结果与核验记录（module=work_sequence|construction_schedule）。"""
+    service = require_service(module)
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"条目 {entry_id} 在 {module} 中不存在")
+    if module == "work_sequence":
+        check = publish_gate.check_work_publish(entry)
+    elif module == "construction_schedule":
+        check = publish_gate.check_schedule_publish(entry)
+    else:
+        raise HTTPException(status_code=400, detail=f"模块 {module} 没有发布资格检查")
+    return {
+        "module": module,
+        "entry_id": entry_id,
+        "check": check,
+        "verification_id": entry.get("核验记录编号"),
+        "verification": entry.get("发布核验"),
+        "publish_todos": list(entry.get("发布待办", [])) if isinstance(entry.get("发布待办"), list) else [],
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import publish_gate as gate
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -17,27 +18,62 @@ class ConstructionScheduleService(BaseModuleService):
     ACTION_RULES = {"发布排期": "已发布", "启动执行": "执行中", "申请延期": "已延期"}
     NEGATIVE_ACTIONS = []
 
+    def create_entry(self, values: dict[str, Any]):
+        entry, missing = super().create_entry(values)
+        if entry is not None and not missing:
+            # 建卡即生成第一版「发布待办」，不必等第一次点发布。
+            gate.sync_schedule_todos(str(entry.get("计划工序", "") or ""))
+        return entry, missing
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(self.MODULE, entry_id)
+        # 已受理的排期发布重复提交：返回当次排期和原核验记录，不重复记账。
+        if action == gate.SCHEDULE_PUBLISH_ACTION and entry is not None:
+            record = gate.accepted_verification(self.MODULE, entry, action)
+            if record is not None:
+                process = str(entry.get("计划工序", "") or "")
+                gate.sync_schedule_todos(process)
+                return entry, gate.duplicate_message(
+                    self.ENTITY, action, record, str(entry.get("status", "") or ""))
+            updated, message = super().run_action(entry_id, action)
+            if updated is not None and "核验记录编号" not in message:
+                rec = gate.find_verification(self.MODULE, entry_id, action)
+                message += gate.success_suffix(rec)
+            return updated, message
+        # 现场没收到启动回执时重复点「启动执行」：若已进入执行中，凭这份排期继续。
+        if action == gate.SCHEDULE_START_ACTION and entry is not None \
+                and entry.get("status") == "执行中":
+            return entry, (
+                "排期已启动执行，当次启动已受理；无需重填开工单，"
+                f"直接凭本排期#{entry_id}继续现场执行"
+            )
+        return super().run_action(entry_id, action)
+
     def cross_module_verify(
         self, entry_id: int, action: str, entry: dict[str, Any]
     ) -> tuple[bool, str]:
         process = entry.get("计划工序", "")
         if action == "发布排期":
-            # 对应工序必须已发布
-            ws_rows = store.query_by_field("work_sequence", "工序名称", process)
-            if ws_rows and all(r.get("status") == "待排期" for r in ws_rows):
-                return False, f"对应工序「{process}」尚未发布，无法发布排期"
-            # 对应安全交底必须已签认
-            safety = store.query_by_field("safety_briefing", "交底工序", process)
-            if not safety:
-                return False, f"工序「{process}」缺少安全交底记录"
-            if not any(s.get("status") == "已签认" for s in safety):
-                return False, "安全交底尚未签认，不能发布排期"
+            result = gate.check_schedule_publish(entry)
+            entry["发布资格检查"] = result
+            entry["最近检查"] = result
+            entry["发布缺项"] = result["missing"]
+            gate.sync_schedule_todos(str(process or ""))
+            if not result["ready"]:
+                return False, result["message"]
+            return True, ""
         if action == "启动执行":
             # 检查是否有关联变更签证未处理
             cs = store.query_by_field("change_order", "影响工序", process)
             pending_changes = [c for c in cs if c.get("status") == "已提出"]
             if pending_changes:
                 return False, f"工序「{process}」有{len(pending_changes)}条待签认变更"
+            # 两份发布（工序发布、排期发布）都必须已受理；未受理时给出带编号的
+            # 具体缺项和原入口，方便班组在启动入口直接交接。
+            passed, reason, summary = gate.start_execution_guard(entry)
+            entry["发布资格"] = summary
+            if not passed:
+                return False, reason
         if action == "申请延期":
             # 检查是否有变更签证支撑延期
             cs = store.query_by_field("change_order", "影响工序", process)
@@ -50,12 +86,24 @@ class ConstructionScheduleService(BaseModuleService):
     ) -> list[dict]:
         effects = []
         if action == "发布排期":
-            process = entry.get("计划工序", "")
+            process = str(entry.get("计划工序", "") or "")
+            # 留存排期发布自己的核验记录（不借用工序发布的成功结果）。
+            result = gate.check_schedule_publish(entry)
+            record, _created = gate.record_verification(
+                module=self.MODULE,
+                entry_id=entry_id,
+                action=action,
+                process_name=process,
+                gate_result=result,
+            )
+            gate.attach_verification(entry, record)
             # 排期发布后更新关联工序
             for ws_row in store.rows("work_sequence"):
                 if ws_row.get("工序名称", "") == process and ws_row.get("status") == "已发布":
                     ws_row["排期已就绪"] = True
                     effects.append(dict(ws_row))
+            # 发布待办清空/同步为已受理状态
+            gate.sync_schedule_todos(process)
         elif action == "已延期":
             process = entry.get("计划工序", "")
             for ws_row in store.rows("work_sequence"):

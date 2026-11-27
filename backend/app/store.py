@@ -23,9 +23,25 @@ class Store:
         # 跨模块锁：{resource_key: thread_id}  用于并发场景 tolerance
         self._resource_locks: dict[str, int] = {}
 
+    # 内部台账表（非业务模块），不计入 module_names / 健康检查模块数。
+    INTERNAL_TABLES = frozenset({
+        "publish_verification", "verification_record",
+        "publish_verification_record", "publish_check_record",
+        "publish_record", "publish_records", "qualification_record",
+        "gate_record", "核验记录", "发布核验记录", "资格核验记录",
+        "publish_todo", "publish_todos",
+    })
+
     # ── 基础访问 ──
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        internal = set(self.INTERNAL_TABLES)
+        # 与发布资格中心维护的内部台账表保持同一份名单，避免枚举到内部表。
+        try:
+            from app.services.publish_gate import INTERNAL_TABLES as gate_tables
+            internal.update(gate_tables)
+        except Exception:
+            pass
+        return sorted(name for name in self._tables if name not in internal)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

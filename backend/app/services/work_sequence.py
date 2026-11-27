@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import publish_gate as gate
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -17,30 +18,37 @@ class WorkSequenceService(BaseModuleService):
     ACTION_RULES = {"发布工序": "已发布", "开始施工": "施工中", "完成工序": "已完成"}
     NEGATIVE_ACTIONS = []
 
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        # 已受理的发布重复提交（旧页面重发/响应丢失重试）：直接返回当次条目与
+        # 原核验记录，不再走一遍状态流转，也不重复记核验账。
+        if action == gate.WORK_PUBLISH_ACTION:
+            entry = store.find(self.MODULE, entry_id)
+            if entry is not None:
+                record = gate.accepted_verification(self.MODULE, entry, action)
+                if record is not None:
+                    gate.sync_schedule_todos(str(entry.get("工序名称", "") or ""))
+                    return entry, gate.duplicate_message(
+                        self.ENTITY, action, record, str(entry.get("status", "") or ""))
+            updated, message = super().run_action(entry_id, action)
+            if updated is not None and "核验记录编号" not in message:
+                rec = gate.find_verification(self.MODULE, entry_id, action)
+                message += gate.success_suffix(rec)
+            return updated, message
+        return super().run_action(entry_id, action)
+
     def cross_module_verify(
         self, entry_id: int, action: str, entry: dict[str, Any]
     ) -> tuple[bool, str]:
         if action == "发布工序":
-            # 1. 检查前置工序是否已完成
-            prereq = entry.get("前置工序", "")
-            if prereq and prereq != "无":
-                matched = False
-                for row in store.rows("work_sequence"):
-                    if row.get("工序名称", "") == prereq and row.get("id") != entry_id:
-                        matched = True
-                        if row.get("status") != "已完成":
-                            return False, f"前置工序「{prereq}」尚未完成，当前状态「{row.get('status', '')}」"
-                        break
-                if not matched and prereq != "无":
-                    return False, f"前置工序「{prereq}」在系统中不存在"
-            # 2. 检查关联安全交底是否已签认
-            process_name = entry.get("工序名称", "")
-            safety_records = store.query_by_field("safety_briefing", "交底工序", process_name)
-            if not safety_records:
-                return False, f"工序「{process_name}」缺少安全交底记录"
-            unsigned = [r for r in safety_records if r.get("status") != "已签认"]
-            if unsigned:
-                return False, f"安全交底未完全签认，尚有{len(unsigned)}条待签认"
+            result = gate.check_work_publish(entry)
+            # 把本次检查结果（含缺项编号）留在条目上，并同步到排期发布待办。
+            entry["发布资格检查"] = result
+            entry["最近检查"] = result
+            entry["发布缺项"] = result["missing"]
+            gate.sync_schedule_todos(str(entry.get("工序名称", "") or ""))
+            if not result["ready"]:
+                return False, result["message"]
+            return True, ""
         if action == "开始施工":
             process_name = entry.get("工序名称", "")
             # 检查工匠是否已到岗
@@ -59,6 +67,20 @@ class WorkSequenceService(BaseModuleService):
         self, entry_id: int, action: str, entry: dict[str, Any]
     ) -> list[dict]:
         effects = []
+        if action == "发布工序":
+            process_name = str(entry.get("工序名称", "") or "")
+            result = gate.check_work_publish(entry)
+            record, _created = gate.record_verification(
+                module=self.MODULE,
+                entry_id=entry_id,
+                action=action,
+                process_name=process_name,
+                gate_result=result,
+            )
+            gate.attach_verification(entry, record)
+            # 同步发布待办：本工序已受理后，对应排期待办移除工序缺项。
+            for sched in gate.sync_schedule_todos(process_name):
+                effects.append(dict(sched))
         if action == "完成工序":
             process_name = entry.get("工序名称", "")
             # 工序完成后联动更新关联施工排期
@@ -74,6 +96,8 @@ class WorkSequenceService(BaseModuleService):
                         log["status"] = "已归档"
                         log["pending"] = False
                         effects.append(dict(log))
+            # 前置工序完成回执到达：刷新依赖它的工序对应排期发布待办。
+            gate.sync_dependent_work_todos(str(process_name or ""))
         return effects
 
     def domain_snapshot(self) -> dict[str, Any]:
